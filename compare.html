@@ -1,0 +1,583 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Polyphonic EFE — Comparison</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; background:#fafafa; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; background:#fff; margin-bottom: 12px; }
+    .title { font-weight: 650; margin: 0 0 6px 0; }
+    .sub { font-size: 12px; color: #555; margin: 0 0 10px 0; line-height: 1.35; }
+    #equityCmp { height: 520px; }
+    #ddCmp { height: 260px; }
+    .topbar { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom: 8px; }
+    .nav a { font-size: 13px; text-decoration:none; border:1px solid #ddd; padding:6px 10px; border-radius:10px; background:#fff; color:#222; }
+    .nav a:hover { background:#f3f3f3; }
+    .muted{ color:#666; font-size:12px; margin:6px 0 0 0; }
+    code { background:#f5f5f5; padding:1px 6px; border-radius:8px; }
+    .err { border-color:#f2c6c6; background:#fff6f6; }
+    .ok  { border-color:#d9ead3; background:#f7fff7; }
+    .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size:12px; }
+    #rollSharpe { height: 320px; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <h2 style="margin:0 0 6px 0;">Polyphonic EFE — Benchmark Comparison</h2>
+      <div class="muted">Strategy vs 60/40 vs Equal-Weight, constructed from the same input price data.</div>
+    </div>
+    <div class="nav">
+      <a href="dashboard.html">← Back to dashboard</a>
+    </div>
+  </div>
+
+  <div class="card ok" id="diagCard">
+    <div class="title">Diagnostics</div>
+    <div class="sub">If plots are empty, this tells you whether files loaded and whether dates intersect.</div>
+    <div class="mono" id="diagText">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="title">Equity curves (normalised)</div>
+    <div class="sub">
+      Strategy equity comes from <code>polyphonic_efe_out_equity.csv</code>.
+      Benchmarks are built from <code>ml_prices_stacked.csv</code> with investibility handling
+      (missing prices → asset weight becomes 0; remaining weights renormalised).
+    </div>
+    <div id="equityCmp"></div>
+  </div>
+
+  <div class="card">
+    <div class="title">Drawdown comparison</div>
+    <div class="sub">Peak-to-trough equity decline for each curve.</div>
+    <div id="ddCmp"></div>
+  </div>
+
+  <div class="card">
+    <div class="title">Performance stats (on common date range)</div>
+    <div class="sub">Computed from daily returns. Sharpe assumes rf = 0 for now (easy to add later).</div>
+    <div id="statsTable" style="overflow-x:auto;"></div>
+  </div>
+
+  <div class="card">
+    <div class="title">Rolling Sharpe (252d)</div>
+    <div class="sub">Rolling annualised Sharpe based on daily returns (window = 252 trading days).</div>
+    <div id="rollSharpe" class="plot"></div>
+  </div>
+
+
+<script>
+/* ---------- helpers: robust date + column handling ---------- */
+
+function normDate(d){
+  // Normalise dates to YYYY-MM-DD.
+  // Handles:
+  //  - "YYYY-MM-DD"
+  //  - "YYYY-MM-DD HH:MM:SS"
+  //  - "DD/MM/YYYY" (UK-style)
+  //  - "DD/MM/YYYY HH:MM:SS"
+  if (d == null) return null;
+
+  const s0 = String(d).trim();
+  if (!s0) return null;
+
+  // keep just the date part if there is a time appended
+  const s = s0.split(" ")[0];
+
+  // ISO already
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // Slash format
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m){
+    let a = parseInt(m[1], 10); // could be dd or mm
+    let b = parseInt(m[2], 10); // could be mm or dd
+    let yyyy = m[3];
+
+    // Disambiguate:
+    // - if a>12 => definitely DD/MM
+    // - if b>12 => definitely MM/DD
+    // - otherwise assume DD/MM (UK default)
+    let dd, mm;
+    if (a > 12) { dd = a; mm = b; }
+    else if (b > 12) { mm = a; dd = b; }
+    else { dd = a; mm = b; }
+
+    const dd2 = String(dd).padStart(2, "0");
+    const mm2 = String(mm).padStart(2, "0");
+    return `${yyyy}-${mm2}-${dd2}`;
+  }
+
+  // Fallback: if it *starts* with YYYY-MM-DD, take it
+  if (s0.length >= 10 && /^\d{4}-\d{2}-\d{2}/.test(s0)) return s0.slice(0,10);
+
+  return s; // last resort
+}
+
+
+function pickDateKey(row){
+  if (!row) return null;
+  const ks = Object.keys(row);
+  const k = ks.find(x => x.toLowerCase() === "date") ||
+            ks.find(x => x.toLowerCase() === "datetime") ||
+            ks.find(x => x.toLowerCase() === "time");
+  return k || null;
+}
+
+async function loadCSV(path) {
+  const resp = await fetch(path);
+  if (!resp.ok) throw new Error(`Failed to fetch ${path} (${resp.status})`);
+  const text = await resp.text();
+  const parsed = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true });
+  if (parsed.errors && parsed.errors.length){
+    console.warn("PapaParse warnings for", path, parsed.errors.slice(0,3));
+  }
+  return parsed.data;
+}
+
+function toDateKey(d){
+  if (d == null) return "";
+  const s = String(d).trim();
+  if (!s) return "";
+
+  // ISO-ish: "YYYY-MM-DD..." → take first 10
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+
+  // UK/Euro: "DD/MM/YYYY" → convert to "YYYY-MM-DD"
+  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  if (m){
+    const dd = m[1], mm = m[2], yyyy = m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  // Fallback: try first 10 chars
+  return s.length >= 10 ? s.slice(0, 10) : s;
+}
+
+
+function dates(rows) {
+  const dk = pickDateKey(rows[0]);
+  if (!dk) throw new Error("No date column found (expected 'date' or 'Date').");
+  return rows.map(r => normDate(r[dk]));
+}
+
+function colnames(rows) {
+  return Object.keys(rows[0] || {}).filter(k => k.toLowerCase() !== "date");
+}
+
+function intersectDates(aDates, bDates){
+  const setB = new Set(bDates);
+  return aDates.filter(d => setB.has(d));
+}
+
+/* ---------- prices: pivot stacked → wide by date,ticker ---------- */
+
+async function loadStackedPrices(path) {
+  const rows = await loadCSV(path);
+
+  // detect keys (case-insensitive)
+  const kDate   = pickDateKey(rows[0]);
+  const kTicker = Object.keys(rows[0] || {}).find(k => k.toLowerCase() === "ticker");
+  if (!kDate || !kTicker) throw new Error("Stacked prices must include date + ticker columns.");
+
+  // price key preference
+  const keys = Object.keys(rows[0] || {}).map(k => k.toLowerCase());
+  const kClose = Object.keys(rows[0] || {}).find(k => k.toLowerCase() === "close");
+  const kValue = Object.keys(rows[0] || {}).find(k => k.toLowerCase() === "value");
+  const kPrice = Object.keys(rows[0] || {}).find(k => k.toLowerCase() === "price");
+  const pxKey = kClose || kValue || kPrice;
+  if (!pxKey) throw new Error("Stacked prices needs a close/value/price column.");
+
+  const map = {};
+  rows.forEach(r => {
+    const d = normDate(r[kDate]);
+    const t = r[kTicker];
+    if (!d || !t) return;
+    const px = r[pxKey];
+    if (!map[d]) map[d] = { date: d };
+    map[d][t] = (px != null && isFinite(px)) ? Number(px) : null;
+  });
+
+  return Object.values(map).sort((a,b) => new Date(a.date) - new Date(b.date));
+}
+
+function makePriceMap(wideRows){
+  const m = {};
+  wideRows.forEach(r => { m[r.date] = r; });
+  return m;
+}
+
+function dailyReturnsFromPrices(dates, priceMap, tickers){
+  const ret = [];
+  for (let i=1; i<dates.length; i++){
+    const d0 = dates[i-1], d1 = dates[i];
+    const r0 = priceMap[d0], r1 = priceMap[d1];
+    const row = {};
+    tickers.forEach(t=>{
+      const a = r0 ? r0[t] : null;
+      const b = r1 ? r1[t] : null;
+      if (a==null || b==null || !isFinite(a) || !isFinite(b) || a<=0) row[t] = null;
+      else row[t] = (b/a)-1;
+    });
+    ret.push(row);
+  }
+  return ret;
+}
+
+function renormalizeWeights(w, available){
+  let s = 0;
+  const out = {};
+  Object.keys(w).forEach(k=>{
+    const wk = w[k];
+    if (available.has(k) && wk!=null && isFinite(wk) && wk>0){
+      out[k] = wk; s += wk;
+    } else out[k] = 0;
+  });
+  if (s <= 0) return out;
+  Object.keys(out).forEach(k => out[k] = out[k]/s);
+  return out;
+}
+
+function equityFromConstantWeights(dates, priceMap, targetWeights){
+  const tickers = Object.keys(targetWeights);
+  const rets = dailyReturnsFromPrices(dates, priceMap, tickers);
+  const eq = [1.0];
+
+  for (let i=1; i<dates.length; i++){
+    const d = dates[i];
+    const row = priceMap[d] || {};
+    const available = new Set(tickers.filter(t => row[t]!=null && isFinite(row[t])));
+    const w = renormalizeWeights(targetWeights, available);
+
+    const r = rets[i-1];
+    let port = 0;
+    tickers.forEach(t=>{
+      const rt = r[t];
+      if (w[t] && rt!=null && isFinite(rt)) port += w[t]*rt;
+    });
+
+    eq.push(eq[eq.length-1] * (1 + port));
+  }
+  return eq;
+}
+
+function equityFromEqualWeight(dates, priceMap, tickers){
+  const rets = dailyReturnsFromPrices(dates, priceMap, tickers);
+  const eq = [1.0];
+
+  for (let i=1; i<dates.length; i++){
+    const d = dates[i];
+    const row = priceMap[d] || {};
+    const avail = tickers.filter(t => row[t]!=null && isFinite(row[t]));
+    if (!avail.length){
+      eq.push(eq[eq.length-1]);
+      continue;
+    }
+    const w = 1.0 / avail.length;
+    const r = rets[i-1];
+    let port = 0;
+    avail.forEach(t=>{
+      const rt = r[t];
+      if (rt!=null && isFinite(rt)) port += w*rt;
+    });
+    eq.push(eq[eq.length-1] * (1 + port));
+  }
+  return eq;
+}
+
+function drawdown(equity){
+  let peak = -Infinity;
+  return equity.map(v=>{
+    if (v==null || !isFinite(v)) return null;
+    peak = Math.max(peak, v);
+    return (v/peak) - 1.0;
+  });
+}
+
+function setDiag(lines, isError=false){
+  const card = document.getElementById("diagCard");
+  const text = document.getElementById("diagText");
+  text.textContent = lines.join("\n");
+  if (isError){
+    card.classList.remove("ok");
+    card.classList.add("err");
+  } else {
+    card.classList.remove("err");
+    card.classList.add("ok");
+  }
+}
+
+function computeReturns(x, y) {
+  // y: equity series (positive). returns aligned to x[1:]
+  const rx = [];
+  const r = [];
+  for (let i = 1; i < y.length; i++) {
+    const y0 = y[i - 1], y1 = y[i];
+    if (y0 == null || y1 == null || !isFinite(y0) || !isFinite(y1) || y0 <= 0 || y1 <= 0) continue;
+    rx.push(x[i]);
+    r.push((y1 / y0) - 1.0);
+  }
+  return { x: rx, r };
+}
+
+function rollingSharpe(x, r, win = 252, rfDaily = 0.0) {
+  // annualised rolling Sharpe, aligned to x (same length as r)
+  const out = new Array(r.length).fill(null);
+
+  for (let i = 0; i < r.length; i++) {
+    const j0 = i - win + 1;
+    if (j0 < 0) continue;
+
+    let n = 0, sum = 0, sumsq = 0;
+    for (let j = j0; j <= i; j++) {
+      const v = r[j];
+      if (v == null || !isFinite(v)) continue;
+      const ex = v - rfDaily;
+      n++;
+      sum += ex;
+      sumsq += ex * ex;
+    }
+    if (n < Math.max(30, Math.floor(0.6 * win))) continue;
+
+    const mean = sum / n;
+    const varr = Math.max(0, (sumsq / n) - (mean * mean));
+    const sd = Math.sqrt(varr);
+
+    // annualise: mean*252 / (sd*sqrt(252))
+    if (sd > 0) out[i] = (mean * 252.0) / (sd * Math.sqrt(252.0));
+  }
+
+  return { x, y: out };
+}
+
+function maxDrawdown(y) {
+  let peak = -Infinity;
+  let mdd = 0;
+  for (let i = 0; i < y.length; i++) {
+    const v = y[i];
+    if (v == null || !isFinite(v)) continue;
+    peak = Math.max(peak, v);
+    const dd = (v / peak) - 1.0;
+    mdd = Math.min(mdd, dd);
+  }
+  return mdd; // negative
+}
+
+function perfStats(x, y, ann = 252, rf = 0.0) {
+  // assumes x is daily-ish and y is equity normalised (starts ~1)
+  const { r } = computeReturns(x, y);
+  const rr = r.filter(v => v != null && isFinite(v));
+  if (rr.length < 30) return null;
+
+  const mean = rr.reduce((a,b)=>a+b,0) / rr.length;
+  const varr = rr.reduce((a,b)=>a+(b-mean)*(b-mean),0) / rr.length;
+  const vol = Math.sqrt(Math.max(0,varr)) * Math.sqrt(ann);
+  const ret = mean * ann;
+
+  // CAGR from first to last, using x span in years
+  const y0 = y.find(v => v != null && isFinite(v));
+  const yN = [...y].reverse().find(v => v != null && isFinite(v));
+  const t0 = new Date(x[0]).getTime();
+  const tN = new Date(x[x.length-1]).getTime();
+  const years = Math.max(1e-9, (tN - t0) / (365.25 * 24 * 3600 * 1000));
+  const cagr = (yN / y0) ** (1 / years) - 1;
+
+  const mdd = maxDrawdown(y); // negative
+  const sharpe = vol > 0 ? (ret - rf) / vol : null;
+  const calmar = (mdd < 0) ? (cagr / Math.abs(mdd)) : null;
+
+  return { cagr, vol, sharpe, mdd, calmar };
+}
+
+function renderStatsTable(divId, rows) {
+  // rows: [{name, stats}]
+  const fmtPct = v => (v == null || !isFinite(v)) ? "—" : (100*v).toFixed(2) + "%";
+  const fmtNum = v => (v == null || !isFinite(v)) ? "—" : v.toFixed(2);
+
+  const html = `
+  <table style="border-collapse:collapse; width:100%; font-size:13px;">
+    <thead>
+      <tr>
+        <th style="text-align:left; border-bottom:1px solid #eee; padding:8px;">Series</th>
+        <th style="text-align:right; border-bottom:1px solid #eee; padding:8px;">CAGR</th>
+        <th style="text-align:right; border-bottom:1px solid #eee; padding:8px;">Vol (ann.)</th>
+        <th style="text-align:right; border-bottom:1px solid #eee; padding:8px;">Sharpe</th>
+        <th style="text-align:right; border-bottom:1px solid #eee; padding:8px;">Max DD</th>
+        <th style="text-align:right; border-bottom:1px solid #eee; padding:8px;">Calmar</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map(r => `
+        <tr>
+          <td style="padding:8px; border-bottom:1px solid #f3f3f3;">${r.name}</td>
+          <td style="padding:8px; text-align:right; border-bottom:1px solid #f3f3f3;">${fmtPct(r.stats?.cagr)}</td>
+          <td style="padding:8px; text-align:right; border-bottom:1px solid #f3f3f3;">${fmtPct(r.stats?.vol)}</td>
+          <td style="padding:8px; text-align:right; border-bottom:1px solid #f3f3f3;">${fmtNum(r.stats?.sharpe)}</td>
+          <td style="padding:8px; text-align:right; border-bottom:1px solid #f3f3f3;">${fmtPct(r.stats?.mdd)}</td>
+          <td style="padding:8px; text-align:right; border-bottom:1px solid #f3f3f3;">${fmtNum(r.stats?.calmar)}</td>
+        </tr>
+      `).join("")}
+    </tbody>
+  </table>`;
+  document.getElementById(divId).innerHTML = html;
+}
+
+function rollingSharpePlot(divId, seriesList, win=252) {
+  // seriesList: [{name, x, y}] where y is equity
+  const traces = seriesList.map(s => {
+    const ret = computeReturns(s.x, s.y);
+    const rs = rollingSharpe(ret.x, ret.r, win, 0.0);
+    return {
+      type: "scatter",
+      mode: "lines",
+      name: s.name,
+      x: rs.x,
+      y: rs.y,
+      hovertemplate: `%{x}<br>${s.name} Sharpe: %{y:.2f}<extra></extra>`
+    };
+  });
+
+  Plotly.newPlot(divId, traces, {
+    margin: {l: 50, r: 10, t: 18, b: 35},
+    hovermode: "x unified",
+    legend: {orientation: "h"},
+    yaxis: {zeroline: true}
+  }, {responsive: true});
+}
+
+/* ---------- main ---------- */
+
+async function main(){
+  const diag = [];
+
+  // Strategy equity
+  const strat = await loadCSV("polyphonic_efe_out_equity.csv");
+  if (!strat.length) throw new Error("polyphonic_efe_out_equity.csv loaded but has 0 rows.");
+
+  const stratDatesRaw = dates(strat).map(toDateKey); // <- normalise date keys
+  const yKey =
+      (Object.keys(strat[0]||{}).find(k => k.toLowerCase()==="equity")) ? Object.keys(strat[0]).find(k => k.toLowerCase()==="equity")
+    : (Object.keys(strat[0]||{}).find(k => k.toLowerCase()==="value"))  ? Object.keys(strat[0]).find(k => k.toLowerCase()==="value")
+    : Object.keys(strat[0])[1];
+
+  const stratEqRaw = strat.map(r => {
+    const v = Number(r[yKey]);
+    return Number.isFinite(v) ? v : null;
+  });
+
+  diag.push(`Strategy rows: ${strat.length}`);
+  diag.push(`Strategy date range: ${stratDatesRaw[0]} → ${stratDatesRaw[stratDatesRaw.length-1]}`);
+  diag.push(`Strategy equity column: ${yKey}`);
+
+  // Raw prices
+  const wide = await loadStackedPrices("ml_prices_stacked.csv");
+  if (!wide.length) throw new Error("ml_prices_stacked.csv loaded but pivot produced 0 rows.");
+
+  // normalise date keys in wide too (defensive)
+  wide.forEach(r => { r.date = toDateKey(r.date); });
+
+  const priceDatesRaw = dates(wide);
+  const tickers = colnames(wide);
+  diag.push(`Prices (wide) rows: ${wide.length}`);
+  diag.push(`Prices date range: ${priceDatesRaw[0]} → ${priceDatesRaw[priceDatesRaw.length-1]}`);
+  diag.push(`Tickers detected: ${tickers.join(", ")}`);
+
+  const priceMap = makePriceMap(wide);
+
+  // Align dates
+  const common = intersectDates(stratDatesRaw, priceDatesRaw);
+  diag.push(`Common dates (intersection): ${common.length}`);
+  if (!common.length){
+    diag.push("");
+    diag.push("❌ No intersecting dates. This is usually a date-format mismatch.");
+    diag.push("Check that both files use YYYY-MM-DD. This compare page normalises to first 10 chars.");
+    setDiag(diag, true);
+    return;
+  }
+
+  // Align strategy equity to common dates
+  const idxStrat = new Map(stratDatesRaw.map((d,i)=>[d,i]));
+  let stratEq = common.map(d => stratEqRaw[idxStrat.get(d)]);
+
+  // Benchmarks
+  // NOTE: adjust these tickers if your bond/equity proxies are named differently
+  const w6040 = { SPXGTR: 0.60, SP500BDT: 0.40 };
+  diag.push(`60/40 uses tickers: ${Object.keys(w6040).join(", ")}`);
+  setDiag(diag, false);
+
+  let eq6040 = equityFromConstantWeights(common, priceMap, w6040);
+  let eqEW   = equityFromEqualWeight(common, priceMap, tickers);
+
+  // --- Ensure all curves are normalised to 1 at start (robust + presentation-friendly)
+  function renormToOne(y){
+    const y0 = y.find(v => v != null && Number.isFinite(v));
+    if (y0 == null || y0 === 0) return y;
+    return y.map(v => (v == null || !Number.isFinite(v)) ? null : v / y0);
+  }
+  stratEq = renormToOne(stratEq);
+  eq6040  = renormToOne(eq6040);
+  eqEW    = renormToOne(eqEW);
+
+  // --- Alias variables used by the "pro" panels (fixes your ReferenceError)
+  const xCommon = common;
+  const eqStrategy = stratEq;
+  const eqEqual = eqEW;
+
+  // 1) Stats table
+  const statsRows = [
+    { name: "Strategy (Polyphonic)", stats: perfStats(xCommon, eqStrategy) },
+    { name: "60/40",                 stats: perfStats(xCommon, eq6040) },
+    { name: "Equal-weight",          stats: perfStats(xCommon, eqEqual) },
+  ];
+  renderStatsTable("statsTable", statsRows);
+
+  // 2) Rolling Sharpe plot
+  rollingSharpePlot("rollSharpe", [
+    { name: "Strategy (Polyphonic)", x: xCommon, y: eqStrategy },
+    { name: "60/40",                 x: xCommon, y: eq6040 },
+    { name: "Equal-weight",          x: xCommon, y: eqEqual },
+  ], 252);
+
+  // Plot equity comparison
+  const traces = [
+    { type:"scatter", mode:"lines", name:"Strategy (Polyphonic)", x: xCommon, y: eqStrategy },
+    { type:"scatter", mode:"lines", name:"60/40", x: xCommon, y: eq6040 },
+    { type:"scatter", mode:"lines", name:"Equal-weight (available assets)", x: xCommon, y: eqEqual },
+  ];
+  Plotly.newPlot("equityCmp", traces, {
+    margin:{l:45,r:10,t:18,b:35},
+    hovermode:"x unified",
+    legend:{orientation:"h"},
+    yaxis:{title:"Equity (normalised)"}
+  }, {responsive:true});
+
+  // Plot drawdowns
+  const ddTraces = [
+    { type:"scatter", mode:"lines", name:"Strategy", x: xCommon, y: drawdown(eqStrategy) },
+    { type:"scatter", mode:"lines", name:"60/40", x: xCommon, y: drawdown(eq6040) },
+    { type:"scatter", mode:"lines", name:"Equal-weight", x: xCommon, y: drawdown(eqEqual) },
+  ];
+  Plotly.newPlot("ddCmp", ddTraces, {
+    margin:{l:45,r:10,t:18,b:35},
+    hovermode:"x unified",
+    legend:{orientation:"h"},
+    yaxis:{tickformat:".0%", title:"Drawdown"}
+  }, {responsive:true});
+}
+
+main().catch(e=>{
+  console.error(e);
+  setDiag([
+    "❌ Error building compare page:",
+    String(e),
+    "",
+    "Open DevTools → Console to see the full error trace."
+  ], true);
+});
+
+</script>
+</body>
+</html>

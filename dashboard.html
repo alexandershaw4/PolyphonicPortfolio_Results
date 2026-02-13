@@ -1,0 +1,432 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Polyphonic EFE Portfolio Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; background:#fafafa; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; background:#fff; }
+    .title { font-weight: 650; margin: 0 0 6px 0; }
+    .sub { font-size: 12px; color: #555; margin: 0 0 10px 0; line-height: 1.35; }
+    #inspector { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+
+    /* Plotly sizing */
+    .plot { height: 260px; }
+    #equity { height: 520px; }
+    #weights, #beliefs { height: 320px; }
+    #pi { height: 300px; }
+    #prices { height: 340px; }
+    #drawdown { height: 260px; }
+
+    .explain{
+      border:1px solid #e6e6e6; border-radius:12px;
+      padding:14px 16px; margin:12px 0 18px 0;
+      background:#fff;
+    }
+    .explain h2{ margin:0 0 8px 0; font-size:16px; }
+    .explain ul{ margin:8px 0 8px 18px; padding:0; }
+    .explain li{ margin:6px 0; }
+    .muted{ color:#666; font-size:12px; margin:6px 0 0 0; }
+
+    .inspector-head { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .inspector-head label { font-size: 13px; color:#222; }
+    select { padding: 4px 6px; border-radius: 8px; border:1px solid #ccc; }
+
+    .topbar { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom: 8px; }
+    .nav a { font-size: 13px; text-decoration:none; border:1px solid #ddd; padding:6px 10px; border-radius:10px; background:#fff; color:#222; }
+    .nav a:hover { background:#f3f3f3; }
+
+    .stats { display:grid; grid-template-columns: repeat(6, minmax(140px, 1fr)); gap:10px; }
+    .stat { border:1px solid #eee; border-radius:12px; padding:10px 12px; background:#fff; }
+    .stat .k { font-size: 11px; color:#666; margin-bottom: 2px; }
+    .stat .v { font-size: 18px; font-weight: 650; }
+    .stat .s { font-size: 11px; color:#777; margin-top: 4px; }
+    @media (max-width: 1100px){
+      .stats { grid-template-columns: repeat(3, minmax(140px, 1fr)); }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="topbar">
+    <div>
+      <h2 style="margin:0 0 6px 0;">Polyphonic EFE Portfolio Dashboard</h2>
+      <div class="muted">Interpretable active inference portfolio: latent regimes → objective arbitration (π) → weights → realised equity.</div>
+    </div>
+    <div class="nav">
+      <a href="compare.html">Comparison page (60/40 & Equal Weight)</a>
+    </div>
+  </div>
+
+  <!-- Performance stats -->
+  <div class="card" style="margin-bottom:12px;">
+    <div class="title">Performance snapshot</div>
+    <div class="sub">Computed from the strategy equity curve (daily). Sharpe assumes 0% risk-free.</div>
+    <div class="stats" id="statsRow">
+      <div class="stat"><div class="k">Total return</div><div class="v" id="statTotal">—</div><div class="s" id="statPeriod">—</div></div>
+      <div class="stat"><div class="k">CAGR</div><div class="v" id="statCagr">—</div><div class="s">Annualised growth</div></div>
+      <div class="stat"><div class="k">Volatility</div><div class="v" id="statVol">—</div><div class="s">Annualised stdev</div></div>
+      <div class="stat"><div class="k">Sharpe</div><div class="v" id="statSharpe">—</div><div class="s">Return / vol</div></div>
+      <div class="stat"><div class="k">Max drawdown</div><div class="v" id="statMdd">—</div><div class="s">Peak-to-trough</div></div>
+      <div class="stat"><div class="k">Avg daily turnover</div><div class="v" id="statTo">—</div><div class="s">From weight changes</div></div>
+    </div>
+  </div>
+
+  <section class="explain" id="how-to-read">
+    <h2>How to read this dashboard</h2>
+    <ul>
+      <li><b>Beliefs</b> = “market state estimate” (latent regimes learned from returns).</li>
+      <li><b>Voice π</b> = “what objective dominated this month” (growth vs risk vs drawdown vs turnover).</li>
+      <li><b>Weights</b> = “policy output” (what the agent actually held).</li>
+      <li><b>Equity curve</b> = “result of executing that policy under investibility constraints.”</li>
+    </ul>
+    <p class="muted">
+      Use the Rebalance inspector to jump to a specific rebalance date and see the portfolio decision,
+      the inferred regime, and the objective weighting that produced it.
+    </p>
+  </section>
+
+  <!-- Inspector -->
+  <div class="card">
+    <div class="inspector-head">
+      <div>
+        <div class="title">Rebalance inspector</div>
+        <div class="sub">Pick a date to see the one-step “decision snapshot”: weights, regime belief, and voice dominance at that time.</div>
+      </div>
+      <label>Date:
+        <select id="dateSelect"></select>
+      </label>
+    </div>
+
+    <div id="inspector" style="margin-top:12px;">
+      <div class="card">
+        <div class="title">Weights (at date)</div>
+        <div class="sub">Policy output: what the agent actually held.</div>
+        <div id="inspWeights" class="plot"></div>
+      </div>
+
+      <div class="card">
+        <div class="title">Beliefs (at date)</div>
+        <div class="sub">Market state estimate: posterior over latent regimes.</div>
+        <div id="inspBeliefs" class="plot"></div>
+      </div>
+
+      <div class="card">
+        <div class="title">Voice π (at date)</div>
+        <div class="sub">What objective dominated this month (growth vs risk vs drawdown vs turnover).</div>
+        <div id="inspPi" class="plot"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+
+    <!-- Equity -->
+    <div class="card">
+      <div class="title">Equity curve</div>
+      <div class="sub">Result of executing the policy under investibility constraints (missing prices → asset not tradable).</div>
+      <div id="equity"></div>
+    </div>
+
+    <!-- Raw data -->
+    <div class="card">
+      <div class="title">Raw data (normalised prices)</div>
+      <div class="sub">Sanity check: input series (each normalised to 1 at the first available date). Helps explain investibility / missing-history periods.</div>
+      <div id="prices"></div>
+    </div>
+
+    <!-- Weights & Beliefs -->
+    <div class="row">
+      <div class="card">
+        <div class="title">Weights</div>
+        <div class="sub">Policy output through time (stacked allocations across assets).</div>
+        <div id="weights"></div>
+      </div>
+      <div class="card">
+        <div class="title">Regime beliefs</div>
+        <div class="sub">Market state estimate: posterior probability of each latent regime inferred from returns.</div>
+        <div id="beliefs"></div>
+      </div>
+    </div>
+
+    <!-- Voice pi -->
+    <div class="card">
+      <div class="title">Voice weights (π)</div>
+      <div class="sub">Objective weighting through time: which “voice” is steering decisions (growth vs risk vs drawdown vs turnover).</div>
+      <div id="pi"></div>
+    </div>
+
+    <!-- Drawdown -->
+    <div class="card">
+      <div class="title">Drawdown</div>
+      <div class="sub">Peak-to-trough equity decline through time.</div>
+      <div id="drawdown"></div>
+    </div>
+
+  </div>
+
+<script>
+async function loadCSV(path) {
+  const text = await fetch(path).then(r => r.text());
+  const parsed = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true });
+  return parsed.data;
+}
+
+function colnames(rows) { return Object.keys(rows[0] || {}).filter(k => k !== "date"); }
+function dates(rows) { return rows.map(r => r.date); }
+function series(rows, key) { return rows.map(r => r[key]); }
+
+async function loadStackedPrices(path) {
+  const text = await fetch(path).then(r => r.text());
+  const parsed = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true });
+  const rows = parsed.data;
+
+  const map = {};
+  rows.forEach(r => {
+    const d = r.date;
+    if (!d) return;
+    if (!map[d]) map[d] = { date: d };
+    // prefer close, fallback to price/value
+    const px = (r.close != null && isFinite(r.close)) ? r.close :
+               (r.value != null && isFinite(r.value)) ? r.value :
+               (r.price != null && isFinite(r.price)) ? r.price : null;
+    map[d][r.ticker] = px;
+  });
+
+  return Object.values(map).sort((a,b) => new Date(a.date) - new Date(b.date));
+}
+
+function normalizePrices(rows) {
+  const cols = colnames(rows);
+  const base = {};
+  cols.forEach(c => {
+    const firstValid = rows.find(r => r[c] != null && isFinite(r[c]));
+    base[c] = firstValid ? firstValid[c] : null;
+  });
+
+  return rows.map(r => {
+    const out = { date: r.date };
+    cols.forEach(c => {
+      const v = r[c], b = base[c];
+      out[c] = (v != null && isFinite(v) && b != null && isFinite(b) && b !== 0) ? (v / b) : null;
+    });
+    return out;
+  });
+}
+
+function stackedArea(divId, rows) {
+  const cols = colnames(rows);
+  const x = dates(rows);
+  const traces = cols.map(c => ({
+    type: "scatter", mode: "lines", name: c,
+    x, y: series(rows, c),
+    stackgroup: "one",
+    hovertemplate: `%{x}<br>${c}: %{y:.4f}<extra></extra>`
+  }));
+  Plotly.newPlot(divId, traces, {
+    margin: {l: 45, r: 10, t: 18, b: 35},
+    hovermode: "x unified",
+    legend: {orientation: "h"},
+  }, {responsive: true});
+}
+
+function linePlot(divId, rows) {
+  const cols = colnames(rows);
+  const x = dates(rows);
+  const traces = cols.map(c => ({
+    type: "scatter", mode: "lines", name: c,
+    x, y: series(rows, c),
+    hovertemplate: `%{x}<br>${c}: %{y:.4f}<extra></extra>`
+  }));
+  Plotly.newPlot(divId, traces, {
+    margin: {l: 45, r: 10, t: 18, b: 35},
+    hovermode: "x unified",
+    legend: {orientation: "h"},
+  }, {responsive: true});
+}
+
+function equityPlot(divId, rows) {
+  const x = dates(rows);
+  const yKey = ("equity" in rows[0]) ? "equity" : (("value" in rows[0]) ? "value" : Object.keys(rows[0])[1]);
+  const y = series(rows, yKey).map(v => (v == null ? null : Number(v)));
+  const trace = { type: "scatter", mode: "lines", name: yKey, x, y, hovertemplate: `%{x}<br>${yKey}: %{y:.4f}<extra></extra>` };
+  Plotly.newPlot(divId, [trace], { margin: {l: 45, r: 10, t: 18, b: 35}, hovermode: "x unified" }, {responsive: true});
+  return { x, y };
+}
+
+function pricesPlot(divId, rows) {
+  const cols = colnames(rows);
+  const x = dates(rows);
+  const traces = cols.map(c => ({
+    type: "scatter", mode: "lines", name: c,
+    x, y: series(rows, c),
+    hovertemplate: `%{x}<br>${c}: %{y:.3f}<extra></extra>`
+  }));
+  Plotly.newPlot(divId, traces, {
+    margin: {l: 45, r: 10, t: 18, b: 35},
+    hovermode: "x unified",
+    legend: {orientation: "h"},
+  }, {responsive: true});
+}
+
+function drawdownPlot(divId, x, equityY) {
+  let peak = -Infinity;
+  const dd = equityY.map(v => {
+    if (v == null || !isFinite(v)) return null;
+    peak = Math.max(peak, v);
+    return (v / peak) - 1.0;
+  });
+  const trace = { type: "scatter", mode: "lines", name: "drawdown", x, y: dd, hovertemplate: `%{x}<br>DD: %{y:.2%}<extra></extra>` };
+  Plotly.newPlot(divId, [trace], { margin: {l: 45, r: 10, t: 18, b: 35}, yaxis: {tickformat: ".0%"}, hovermode: "x unified" }, {responsive: true});
+}
+
+function nearestRow(rows, dateStr) {
+  const m = rows.find(r => r.date === dateStr);
+  return m || rows[rows.length - 1];
+}
+
+function inspectorBars(divId, rowObj) {
+  const keys = Object.keys(rowObj).filter(k => k !== "date");
+  const y = keys.map(k => rowObj[k]);
+  const trace = { type: "bar", x: keys, y, hovertemplate: `%{x}: %{y:.4f}<extra></extra>` };
+  Plotly.newPlot(divId, [trace], { margin: {l: 35, r: 10, t: 18, b: 80} }, {responsive: true});
+}
+
+/* ===== performance stats ===== */
+
+function pct(x){ return (100*x).toFixed(2) + "%"; }
+function fmt(x){ return (x==null || !isFinite(x)) ? "—" : x.toFixed(2); }
+
+function computeDailyReturns(equityY){
+  const r = [];
+  for (let i=1; i<equityY.length; i++){
+    const a = equityY[i-1], b = equityY[i];
+    if (a==null || b==null || !isFinite(a) || !isFinite(b) || a<=0) r.push(null);
+    else r.push((b/a)-1);
+  }
+  return r;
+}
+
+function mean(arr){
+  const xs = arr.filter(v => v!=null && isFinite(v));
+  if (!xs.length) return null;
+  return xs.reduce((s,v)=>s+v,0)/xs.length;
+}
+
+function stdev(arr){
+  const m = mean(arr);
+  const xs = arr.filter(v => v!=null && isFinite(v));
+  if (!xs.length || m==null) return null;
+  const v = xs.reduce((s,x)=>s+(x-m)*(x-m),0)/(xs.length-1 || 1);
+  return Math.sqrt(v);
+}
+
+function maxDrawdown(equityY){
+  let peak = -Infinity;
+  let mdd = 0;
+  for (const v of equityY){
+    if (v==null || !isFinite(v)) continue;
+    peak = Math.max(peak, v);
+    mdd = Math.min(mdd, (v/peak)-1);
+  }
+  return mdd; // negative
+}
+
+function computeTurnover(weightsRows){
+  // daily turnover ≈ 0.5 * sum_i |w_t - w_{t-1}|
+  const cols = colnames(weightsRows);
+  const to = [];
+  for (let t=1; t<weightsRows.length; t++){
+    let s = 0;
+    cols.forEach(c=>{
+      const a = Number(weightsRows[t-1][c]);
+      const b = Number(weightsRows[t][c]);
+      if (isFinite(a) && isFinite(b)) s += Math.abs(b-a);
+    });
+    to.push(0.5*s);
+  }
+  return to;
+}
+
+function setStats(xDates, equityY, weightsRows){
+  const start = xDates[0], end = xDates[xDates.length-1];
+  const total = (equityY[0] && equityY[equityY.length-1]) ? (equityY[equityY.length-1]/equityY[0]-1) : null;
+
+  const dr = computeDailyReturns(equityY);
+  const mu = mean(dr);
+  const sd = stdev(dr);
+
+  const ann = 252;
+  const vol = (sd==null)? null : sd*Math.sqrt(ann);
+  const sharpe = (mu==null || sd==null || sd===0)? null : (mu*ann)/(sd*Math.sqrt(ann));
+
+  // CAGR from dates
+  const years = (new Date(end) - new Date(start)) / (365.25*24*3600*1000);
+  const cagr = (years>0 && equityY[0] && equityY[equityY.length-1]) ? Math.pow(equityY[equityY.length-1]/equityY[0], 1/years)-1 : null;
+
+  const mdd = maxDrawdown(equityY);
+  const to = computeTurnover(weightsRows);
+  const toAvg = mean(to);
+
+  document.getElementById("statTotal").textContent = total==null ? "—" : pct(total);
+  document.getElementById("statPeriod").textContent = `${start} → ${end}`;
+  document.getElementById("statCagr").textContent = cagr==null ? "—" : pct(cagr);
+  document.getElementById("statVol").textContent = vol==null ? "—" : pct(vol);
+  document.getElementById("statSharpe").textContent = sharpe==null ? "—" : sharpe.toFixed(2);
+  document.getElementById("statMdd").textContent = mdd==null ? "—" : pct(mdd);
+  document.getElementById("statTo").textContent = toAvg==null ? "—" : pct(toAvg);
+}
+
+async function main() {
+  const equity = await loadCSV("polyphonic_efe_out_equity.csv");
+  const weights = await loadCSV("polyphonic_efe_out_weights.csv");
+  const beliefs = await loadCSV("polyphonic_efe_out_beliefs.csv");
+  const pi = await loadCSV("polyphonic_efe_out_voice_pi.csv");
+
+  // plots
+  const eq = equityPlot("equity", equity);
+  stackedArea("weights", weights);
+  stackedArea("beliefs", beliefs);
+  linePlot("pi", pi);
+  drawdownPlot("drawdown", eq.x, eq.y);
+
+  // stats
+  setStats(eq.x, eq.y, weights);
+
+  // raw input prices (optional)
+  try {
+    const raw = await loadStackedPrices("ml_prices_stacked.csv");
+    const norm = normalizePrices(raw);
+    pricesPlot("prices", norm);
+  } catch (e) {
+    const el = document.getElementById("prices");
+    if (el) el.innerHTML = "<div style='color:#777;font-size:12px;'>ml_prices_stacked.csv not found in this folder.</div>";
+  }
+
+  // date selector
+  const dlist = dates(weights);
+  const sel = document.getElementById("dateSelect");
+  dlist.slice(-500).forEach(d => {
+    const opt = document.createElement("option");
+    opt.value = d; opt.text = d;
+    sel.appendChild(opt);
+  });
+  sel.value = dlist[dlist.length - 1];
+
+  function updateInspector(d) {
+    inspectorBars("inspWeights", nearestRow(weights, d));
+    inspectorBars("inspBeliefs", nearestRow(beliefs, d));
+    inspectorBars("inspPi", nearestRow(pi, d));
+  }
+  updateInspector(sel.value);
+  sel.addEventListener("change", e => updateInspector(e.target.value));
+}
+
+main();
+</script>
+</body>
+</html>
